@@ -4,7 +4,7 @@
 import argparse
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import boto3
 from botocore.exceptions import ClientError
@@ -14,6 +14,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 REGIONS = ['cn-north-1', 'cn-northwest-1']
+
+PERIOD_5MIN = 300
+PERIOD_1HOUR = 3600
 
 
 def _session(profile=None):
@@ -130,24 +133,28 @@ def get_ec2_metrics(instance_id, region, profile=None):
     """Query CloudWatch EC2 metrics for past 1h (5min) and 24h (1h). Returns dict."""
     session = _session(profile)
     cw = session.client('cloudwatch', region_name=region)
-    end = datetime.utcnow()
+    end = datetime.now(timezone.utc)
 
     def _fetch(metric_name, start, period):
-        resp = cw.get_metric_statistics(
-            Namespace='AWS/EC2',
-            MetricName=metric_name,
-            Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
-            StartTime=start,
-            EndTime=end,
-            Period=period,
-            Statistics=['Average', 'Maximum', 'Minimum'],
-        )
+        try:
+            resp = cw.get_metric_statistics(
+                Namespace='AWS/EC2',
+                MetricName=metric_name,
+                Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                StartTime=start,
+                EndTime=end,
+                Period=period,
+                Statistics=['Average', 'Maximum', 'Minimum'],
+            )
+        except ClientError as e:
+            print(f'Warning: CloudWatch metric error for {metric_name}: {e}')
+            return []
         return sorted(resp.get('Datapoints', []), key=lambda x: x['Timestamp'])
 
     metrics = {}
     for name in ['CPUUtilization', 'NetworkIn', 'NetworkOut', 'StatusCheckFailed']:
-        metrics[f'{name}_1h'] = _fetch(name, end - timedelta(hours=1), 300)
-        metrics[f'{name}_24h'] = _fetch(name, end - timedelta(hours=24), 3600)
+        metrics[f'{name}_1h'] = _fetch(name, end - timedelta(hours=1), PERIOD_5MIN)
+        metrics[f'{name}_24h'] = _fetch(name, end - timedelta(hours=24), PERIOD_1HOUR)
     return metrics
 
 
