@@ -29,7 +29,7 @@ def get_cluster_info(cluster_name, profile=None):
             resp = eks.describe_cluster(name=cluster_name)
             return region, resp['cluster']
         except ClientError as e:
-            if 'ResourceNotFoundException' in str(e):
+            if e.response['Error']['Code'] == 'ResourceNotFoundException':
                 continue
             raise
     return None, None
@@ -60,35 +60,36 @@ def get_nodegroup_instances(cluster_name, region, profile=None):
     if not asg_to_nodegroup:
         return instances
 
-    paginator = autoscaling.get_paginator('describe_auto_scaling_instances')
-    for page in paginator.paginate():
-        for inst in page['AutoScalingInstances']:
-            if inst['AutoScalingGroupName'] in asg_to_nodegroup:
-                asg_instance_ids.append({
-                    'InstanceId': inst['InstanceId'],
-                    'AutoScalingGroupName': inst['AutoScalingGroupName'],
-                    'LifecycleState': inst['LifecycleState'],
-                    'NodegroupName': asg_to_nodegroup[inst['AutoScalingGroupName']],
-                })
+    asg_resp = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=list(asg_to_nodegroup.keys()))
+    for asg in asg_resp.get('AutoScalingGroups', []):
+        asg_name = asg['AutoScalingGroupName']
+        for inst in asg.get('Instances', []):
+            asg_instance_ids.append({
+                'InstanceId': inst['InstanceId'],
+                'AutoScalingGroupName': asg_name,
+                'LifecycleState': inst['LifecycleState'],
+                'NodegroupName': asg_to_nodegroup[asg_name],
+            })
 
     if not asg_instance_ids:
         return instances
 
     ids = [i['InstanceId'] for i in asg_instance_ids]
-    resp = ec2.describe_instances(InstanceIds=ids)
     id_to_details = {}
-    for reservation in resp['Reservations']:
-        for inst in reservation['Instances']:
-            name = ''
-            for tag in inst.get('Tags', []):
-                if tag['Key'] == 'Name':
-                    name = tag['Value']
-                    break
-            id_to_details[inst['InstanceId']] = {
-                'InstanceType': inst['InstanceType'],
-                'AvailabilityZone': inst['Placement']['AvailabilityZone'],
-                'Name': name,
-            }
+    for chunk in [ids[i:i + 200] for i in range(0, len(ids), 200)]:
+        resp = ec2.describe_instances(InstanceIds=chunk)
+        for reservation in resp['Reservations']:
+            for inst in reservation['Instances']:
+                name = ''
+                for tag in inst.get('Tags', []):
+                    if tag['Key'] == 'Name':
+                        name = tag['Value']
+                        break
+                id_to_details[inst['InstanceId']] = {
+                    'InstanceType': inst['InstanceType'],
+                    'AvailabilityZone': inst['Placement']['AvailabilityZone'],
+                    'Name': name,
+                }
 
     for mapping in asg_instance_ids:
         iid = mapping['InstanceId']
@@ -115,12 +116,13 @@ def get_instance_health(instance_id, region, profile=None):
         statuses = resp.get('InstanceStatuses', [])
         if not statuses:
             return {'SystemStatus': 'unknown', 'InstanceStatus': 'unknown'}
-        s = statuses[0]
+        status = statuses[0]
         return {
-            'SystemStatus': s.get('SystemStatus', {}).get('Status', 'unknown'),
-            'InstanceStatus': s.get('InstanceStatus', {}).get('Status', 'unknown'),
+            'SystemStatus': status.get('SystemStatus', {}).get('Status', 'unknown'),
+            'InstanceStatus': status.get('InstanceStatus', {}).get('Status', 'unknown'),
         }
     except ClientError as e:
+        print(f'Warning: instance health error: {e}')
         return {'SystemStatus': f'error: {e}', 'InstanceStatus': f'error: {e}'}
 
 
