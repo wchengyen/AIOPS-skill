@@ -158,5 +158,99 @@ def get_ec2_metrics(instance_id, region, profile=None):
     return metrics
 
 
+def _safe_avg(points, key='Average'):
+    if not points:
+        return None
+    return sum(p[key] for p in points) / len(points)
+
+
+def _safe_max(points, key='Maximum'):
+    if not points:
+        return None
+    return max(p[key] for p in points)
+
+
+def _safe_min(points, key='Minimum'):
+    if not points:
+        return None
+    return min(p[key] for p in points)
+
+
+def plot_node_metrics(instance, metrics, output_dir):
+    """Generate per-node CPU + network trend chart. Returns output path or None."""
+    cpu_points = metrics.get('CPUUtilization_24h', [])
+    if not cpu_points:
+        return None
+
+    timestamps = [p['Timestamp'] for p in cpu_points]
+    cpu_avgs = [p['Average'] for p in cpu_points]
+
+    net_in = metrics.get('NetworkIn_24h', [])
+    net_out = metrics.get('NetworkOut_24h', [])
+    net_in_avgs = [p['Average'] / 1024 / 1024 for p in net_in] if net_in else []
+    net_out_avgs = [p['Average'] / 1024 / 1024 for p in net_out] if net_out else []
+
+    label = instance['Name'] or instance['InstanceId']
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+
+    ax1.plot(timestamps, cpu_avgs, linewidth=1.5, color='#2196F3')
+    ax1.set_ylabel('CPU %')
+    ax1.set_ylim(0, max(105, max(cpu_avgs) + 5))
+    ax1.axhline(y=80, color='red', linestyle=':', linewidth=0.8, alpha=0.5)
+    ax1.set_title(f'Node Health — {label} ({instance["InstanceId"]})\n'
+                  f'Type: {instance["InstanceType"]}  AZ: {instance["AvailabilityZone"]}', fontsize=11)
+    ax1.grid(True, alpha=0.3)
+
+    if net_in_avgs and net_out_avgs:
+        ax2.plot(timestamps, net_in_avgs, linewidth=1.5, label='NetworkIn', color='#4CAF50')
+        ax2.plot(timestamps, net_out_avgs, linewidth=1.5, label='NetworkOut', color='#FF9800')
+        ax2.legend(loc='upper right', fontsize=8)
+    ax2.set_ylabel('Network (MiB/s)')
+    ax2.grid(True, alpha=0.3)
+
+    plt.xticks(rotation=30, fontsize=8)
+    plt.tight_layout()
+    fname = os.path.join(output_dir, f'{instance["InstanceId"]}_health.png')
+    plt.savefig(fname, dpi=150)
+    plt.close()
+    return fname
+
+
+def plot_cluster_summary(nodes_data, cluster_name, output_dir):
+    """Generate cluster-wide summary chart. Returns output path or None."""
+    if not nodes_data:
+        return None
+
+    labels = [n['Name'] or n['InstanceId'] for n in nodes_data]
+    cpu_avgs = [n.get('CPUAvg_1h', 0) or 0 for n in nodes_data]
+    health_ok = [1 if n.get('SystemStatus') == 'ok' and n.get('InstanceStatus') == 'ok' else 0 for n in nodes_data]
+
+    x = range(len(labels))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8))
+
+    colors = ['#4CAF50' if v < 50 else '#FFC107' if v < 80 else '#F44336' for v in cpu_avgs]
+    ax1.bar(x, cpu_avgs, color=colors)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+    ax1.set_ylabel('CPU Avg % (1h)')
+    ax1.axhline(y=80, color='red', linestyle=':', linewidth=0.8, alpha=0.5)
+    ax1.set_title(f'Cluster Summary — {cluster_name}', fontsize=11)
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    health_colors = ['#4CAF50' if v == 1 else '#F44336' for v in health_ok]
+    ax2.bar(x, health_ok, color=health_colors)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+    ax2.set_ylabel('Health OK')
+    ax2.set_ylim(0, 1.2)
+    ax2.set_title('EC2 Status Checks (System + Instance)', fontsize=11)
+
+    plt.tight_layout()
+    fname = os.path.join(output_dir, f'{cluster_name}_summary.png')
+    plt.savefig(fname, dpi=150)
+    plt.close()
+    return fname
+
+
 if __name__ == '__main__':
     pass
