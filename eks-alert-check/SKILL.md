@@ -13,7 +13,7 @@ triggers:
 
 # EKS Alert Diagnostic
 
-Respond to EKS alerts by reporting EC2-level health and CloudWatch metrics for underlying worker nodes.
+Respond to EKS alerts by reporting EC2-level node health and CloudWatch metrics for underlying worker nodes in AWS China regions.
 
 ## When to Use
 
@@ -61,3 +61,4 @@ python3 eks_alert_check.py --output /tmp/eks_reports
 4. If node-level, provide the target EC2 instance ID.
 5. The skill queries EKS node groups, EC2 instance status, and CloudWatch metrics.
 6. Summary and charts are printed/saved.
+
