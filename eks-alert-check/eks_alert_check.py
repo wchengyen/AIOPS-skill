@@ -177,7 +177,7 @@ def _safe_min(points, key='Minimum'):
 
 
 def plot_node_metrics(instance, metrics, output_dir):
-    """Generate per-node CPU + network trend chart. Returns output path or None."""
+    """Generate per-node CPU + network trend chart. Returns output path or None if no CPU data."""
     cpu_points = metrics.get('CPUUtilization_24h', [])
     if not cpu_points:
         return None
@@ -201,15 +201,18 @@ def plot_node_metrics(instance, metrics, output_dir):
                   f'Type: {instance["InstanceType"]}  AZ: {instance["AvailabilityZone"]}', fontsize=11)
     ax1.grid(True, alpha=0.3)
 
-    if net_in_avgs and net_out_avgs:
-        ax2.plot(timestamps, net_in_avgs, linewidth=1.5, label='NetworkIn', color='#4CAF50')
-        ax2.plot(timestamps, net_out_avgs, linewidth=1.5, label='NetworkOut', color='#FF9800')
+    if net_in_avgs or net_out_avgs:
+        if net_in_avgs:
+            ax2.plot(timestamps, net_in_avgs, linewidth=1.5, label='NetworkIn', color='#4CAF50')
+        if net_out_avgs:
+            ax2.plot(timestamps, net_out_avgs, linewidth=1.5, label='NetworkOut', color='#FF9800')
         ax2.legend(loc='upper right', fontsize=8)
     ax2.set_ylabel('Network (MiB/s)')
     ax2.grid(True, alpha=0.3)
 
     plt.xticks(rotation=30, fontsize=8)
     plt.tight_layout()
+    os.makedirs(output_dir, exist_ok=True)
     fname = os.path.join(output_dir, f'{instance["InstanceId"]}_health.png')
     plt.savefig(fname, dpi=150)
     plt.close()
@@ -217,7 +220,7 @@ def plot_node_metrics(instance, metrics, output_dir):
 
 
 def plot_cluster_summary(nodes_data, cluster_name, output_dir):
-    """Generate cluster-wide summary chart. Returns output path or None."""
+    """Generate cluster-wide summary chart. Returns output path or None if nodes_data is empty."""
     if not nodes_data:
         return None
 
@@ -246,6 +249,7 @@ def plot_cluster_summary(nodes_data, cluster_name, output_dir):
     ax2.set_title('EC2 Status Checks (System + Instance)', fontsize=11)
 
     plt.tight_layout()
+    os.makedirs(output_dir, exist_ok=True)
     fname = os.path.join(output_dir, f'{cluster_name}_summary.png')
     plt.savefig(fname, dpi=150)
     plt.close()
