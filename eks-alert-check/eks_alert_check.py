@@ -19,8 +19,32 @@ PERIOD_5MIN = 300
 PERIOD_1HOUR = 3600
 
 
+_SESSION_CACHE = {}
+
+
 def _session(profile=None):
-    return boto3.Session(profile_name=profile) if profile else boto3.Session()
+    if profile not in _SESSION_CACHE:
+        _SESSION_CACHE[profile] = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    return _SESSION_CACHE[profile]
+
+
+def _get_name_from_tags(tags):
+    for tag in tags or []:
+        if tag.get('Key') == 'Name':
+            return tag.get('Value', '')
+    return ''
+
+
+def _status_flag(cpu_avg, health):
+    if health.get('SystemStatus') != 'ok' or health.get('InstanceStatus') != 'ok':
+        return '🔴'
+    if cpu_avg is None:
+        return '🟢'
+    if cpu_avg > 80:
+        return '🔴'
+    if cpu_avg > 50:
+        return '🟡'
+    return '🟢'
 
 
 def get_cluster_info(cluster_name, profile=None):
@@ -32,7 +56,7 @@ def get_cluster_info(cluster_name, profile=None):
             resp = eks.describe_cluster(name=cluster_name)
             return region, resp['cluster']
         except ClientError as e:
-            if e.response['Error']['Code'] == 'ResourceNotFoundException':
+            if e.response.get('Error', {}).get('Code') == 'ResourceNotFoundException':
                 continue
             raise
     return None, None
@@ -83,11 +107,7 @@ def get_nodegroup_instances(cluster_name, region, profile=None):
         resp = ec2.describe_instances(InstanceIds=chunk)
         for reservation in resp['Reservations']:
             for inst in reservation['Instances']:
-                name = ''
-                for tag in inst.get('Tags', []):
-                    if tag['Key'] == 'Name':
-                        name = tag['Value']
-                        break
+                name = _get_name_from_tags(inst.get('Tags'))
                 id_to_details[inst['InstanceId']] = {
                     'InstanceType': inst['InstanceType'],
                     'AvailabilityZone': inst['Placement']['AvailabilityZone'],
@@ -298,18 +318,23 @@ def main():
         ec2 = _session(args.profile).client('ec2', region_name=region)
         try:
             inst_resp = ec2.describe_instances(InstanceIds=[instance_id])
-            inst = inst_resp['Reservations'][0]['Instances'][0]
-            name = ''
-            for tag in inst.get('Tags', []):
-                if tag['Key'] == 'Name':
-                    name = tag['Value']
-                    break
-            instance_info = {
-                'InstanceId': instance_id,
-                'Name': name,
-                'InstanceType': inst['InstanceType'],
-                'AvailabilityZone': inst['Placement']['AvailabilityZone'],
-            }
+            reservations = inst_resp.get('Reservations', [])
+            if reservations and reservations[0].get('Instances'):
+                inst = reservations[0]['Instances'][0]
+                instance_info = {
+                    'InstanceId': instance_id,
+                    'Name': _get_name_from_tags(inst.get('Tags')),
+                    'InstanceType': inst['InstanceType'],
+                    'AvailabilityZone': inst['Placement']['AvailabilityZone'],
+                }
+            else:
+                print('Warning: could not describe instance: no data returned')
+                instance_info = {
+                    'InstanceId': instance_id,
+                    'Name': '',
+                    'InstanceType': 'unknown',
+                    'AvailabilityZone': 'unknown',
+                }
         except ClientError as e:
             print(f'Warning: could not describe instance: {e}')
             instance_info = {
@@ -322,14 +347,7 @@ def main():
         chart = plot_node_metrics(instance_info, metrics, args.output)
 
         cpu_avg = _safe_avg(metrics.get('CPUUtilization_1h', []))
-        status_flag = '🟢'
-        if cpu_avg is not None:
-            if cpu_avg > 80:
-                status_flag = '🔴'
-            elif cpu_avg > 50:
-                status_flag = '🟡'
-        if health.get('SystemStatus') != 'ok' or health.get('InstanceStatus') != 'ok':
-            status_flag = '🔴'
+        status_flag = _status_flag(cpu_avg, health)
 
         print(f'\n{"="*80}')
         print(f'  EKS Node Report')
@@ -368,14 +386,7 @@ def main():
 
         cpu_avg = _safe_avg(metrics.get('CPUUtilization_1h', []))
         net_in_avg = _safe_avg(metrics.get('NetworkIn_1h', []))
-        status_flag = '🟢'
-        if cpu_avg is not None:
-            if cpu_avg > 80:
-                status_flag = '🔴'
-            elif cpu_avg > 50:
-                status_flag = '🟡'
-        if health.get('SystemStatus') != 'ok' or health.get('InstanceStatus') != 'ok':
-            status_flag = '🔴'
+        status_flag = _status_flag(cpu_avg, health)
 
         inst['SystemStatus'] = health['SystemStatus']
         inst['InstanceStatus'] = health['InstanceStatus']
