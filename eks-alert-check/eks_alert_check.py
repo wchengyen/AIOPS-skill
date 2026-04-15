@@ -256,5 +256,155 @@ def plot_cluster_summary(nodes_data, cluster_name, output_dir):
     return fname
 
 
+def _prompt(question):
+    return input(question).strip()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='EKS Alert Diagnostic')
+    parser.add_argument('--profile', help='AWS profile name')
+    parser.add_argument('--output', default='eks_reports', help='Output directory (default: eks_reports)')
+    args = parser.parse_args()
+
+    os.makedirs(args.output, exist_ok=True)
+
+    cluster_name = _prompt('EKS cluster name: ')
+    if not cluster_name:
+        print('Cluster name is required.')
+        sys.exit(1)
+
+    print(f'Looking up cluster "{cluster_name}" in {", ".join(REGIONS)} ...')
+    region, cluster_info = get_cluster_info(cluster_name, args.profile)
+    if not cluster_info:
+        print(f'Cluster "{cluster_name}" not found in any region.')
+        sys.exit(1)
+
+    print(f'Found cluster in {region}. Status: {cluster_info.get("status", "unknown")}')
+
+    mode = _prompt('Report mode (node/cluster): ').lower()
+    while mode not in ('node', 'cluster'):
+        mode = _prompt('Please enter "node" or "cluster": ').lower()
+
+    if mode == 'node':
+        instance_id = _prompt('EC2 Instance ID (e.g., i-xxxxxxxxxxxxxxxxx): ').strip()
+        if not instance_id:
+            print('Instance ID is required for node-level report.')
+            sys.exit(1)
+
+        print(f'Fetching health and metrics for {instance_id} ...')
+        health = get_instance_health(instance_id, region, args.profile)
+        metrics = get_ec2_metrics(instance_id, region, args.profile)
+
+        ec2 = _session(args.profile).client('ec2', region_name=region)
+        try:
+            inst_resp = ec2.describe_instances(InstanceIds=[instance_id])
+            inst = inst_resp['Reservations'][0]['Instances'][0]
+            name = ''
+            for tag in inst.get('Tags', []):
+                if tag['Key'] == 'Name':
+                    name = tag['Value']
+                    break
+            instance_info = {
+                'InstanceId': instance_id,
+                'Name': name,
+                'InstanceType': inst['InstanceType'],
+                'AvailabilityZone': inst['Placement']['AvailabilityZone'],
+            }
+        except ClientError as e:
+            print(f'Warning: could not describe instance: {e}')
+            instance_info = {
+                'InstanceId': instance_id,
+                'Name': '',
+                'InstanceType': 'unknown',
+                'AvailabilityZone': 'unknown',
+            }
+
+        chart = plot_node_metrics(instance_info, metrics, args.output)
+
+        cpu_avg = _safe_avg(metrics.get('CPUUtilization_1h', []))
+        status_flag = '🟢'
+        if cpu_avg is not None:
+            if cpu_avg > 80:
+                status_flag = '🔴'
+            elif cpu_avg > 50:
+                status_flag = '🟡'
+        if health.get('SystemStatus') != 'ok' or health.get('InstanceStatus') != 'ok':
+            status_flag = '🔴'
+
+        print(f'\n{"="*80}')
+        print(f'  EKS Node Report')
+        print(f'{"="*80}')
+        print(f'  Instance:      {instance_id}')
+        print(f'  Name:          {instance_info["Name"] or "-"}')
+        print(f'  Type:          {instance_info["InstanceType"]}')
+        print(f'  AZ:            {instance_info["AvailabilityZone"]}')
+        print(f'  System Status: {health["SystemStatus"]}')
+        print(f'  Instance Status: {health["InstanceStatus"]}')
+        if cpu_avg is not None:
+            print(f'  CPU Avg (1h):  {cpu_avg:.1f}%  {status_flag}')
+        else:
+            print('  CPU Avg (1h):  no data')
+        if chart:
+            print(f'  Chart:         {chart}')
+        print(f'{"="*80}')
+        return
+
+    # cluster mode
+    print('Discovering managed node groups ...')
+    instances = get_nodegroup_instances(cluster_name, region, args.profile)
+    if not instances:
+        print('No managed node group instances found.')
+        sys.exit(0)
+
+    print(f'Found {len(instances)} instance(s)\n')
+    results = []
+    for inst in instances:
+        iid = inst['InstanceId']
+        label = inst['Name'] or iid
+        print(f'  [{inst["NodegroupName"]}] {label} ({inst["InstanceType"]}) ... ', end='', flush=True)
+        health = get_instance_health(iid, region, args.profile)
+        metrics = get_ec2_metrics(iid, region, args.profile)
+        chart = plot_node_metrics(inst, metrics, args.output)
+
+        cpu_avg = _safe_avg(metrics.get('CPUUtilization_1h', []))
+        net_in_avg = _safe_avg(metrics.get('NetworkIn_1h', []))
+        status_flag = '🟢'
+        if cpu_avg is not None:
+            if cpu_avg > 80:
+                status_flag = '🔴'
+            elif cpu_avg > 50:
+                status_flag = '🟡'
+        if health.get('SystemStatus') != 'ok' or health.get('InstanceStatus') != 'ok':
+            status_flag = '🔴'
+
+        inst['SystemStatus'] = health['SystemStatus']
+        inst['InstanceStatus'] = health['InstanceStatus']
+        inst['CPUAvg_1h'] = cpu_avg
+        inst['NetworkInAvg_1h'] = net_in_avg
+        inst['Chart'] = chart
+        inst['Flag'] = status_flag
+        results.append(inst)
+        if cpu_avg is not None:
+            print(f'CPU={cpu_avg:.1f}%  Health={health["SystemStatus"]}/{health["InstanceStatus"]}  {status_flag}')
+        else:
+            print('no data')
+
+    summary_chart = plot_cluster_summary(results, cluster_name, args.output)
+
+    print(f'\n{"="*110}')
+    print(f'  EKS Cluster Report — {cluster_name}  ({region})')
+    print(f'{"="*110}')
+    print(f'  {"Instance ID":<22} {"Nodegroup":<18} {"Type":<12} {"AZ":<14} {"Sys":<8} {"Inst":<8} {"CPU%":>8} {"Flag":>6}')
+    print(f'  {"-"*110}')
+    for r in results:
+        cpu_str = f'{r["CPUAvg_1h"]:.1f}' if r.get('CPUAvg_1h') is not None else '-'
+        print(f'  {r["InstanceId"]:<22} {r["NodegroupName"]:<18} {r["InstanceType"]:<12} {r["AvailabilityZone"]:<14} '
+              f'{r["SystemStatus"]:<8} {r["InstanceStatus"]:<8} {cpu_str:>8} {r["Flag"]:>6}')
+    print(f'{"="*110}')
+    if summary_chart:
+        print(f'\nSummary chart: {summary_chart}')
+    print(f'Charts saved to: {os.path.abspath(args.output)}/')
+
+
 if __name__ == '__main__':
-    pass
+    main()
