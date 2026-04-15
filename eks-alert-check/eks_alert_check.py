@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""EKS Alert Diagnostic — Report EC2-level health and metrics for EKS worker nodes."""
+
+import argparse
+import os
+import sys
+from datetime import datetime, timedelta
+
+import boto3
+from botocore.exceptions import ClientError
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+REGIONS = ['cn-north-1', 'cn-northwest-1']
+
+
+def _session(profile=None):
+    return boto3.Session(profile_name=profile) if profile else boto3.Session()
+
+
+def get_cluster_info(cluster_name, profile=None):
+    """Validate cluster exists in either China region. Returns (region, cluster_info) or None."""
+    session = _session(profile)
+    for region in REGIONS:
+        try:
+            eks = session.client('eks', region_name=region)
+            resp = eks.describe_cluster(name=cluster_name)
+            return region, resp['cluster']
+        except ClientError as e:
+            if 'ResourceNotFoundException' in str(e):
+                continue
+            raise
+    return None, None
+
+
+def get_nodegroup_instances(cluster_name, region, profile=None):
+    """Map managed node groups to EC2 instances. Returns list of dicts."""
+    session = _session(profile)
+    eks = session.client('eks', region_name=region)
+    autoscaling = session.client('autoscaling', region_name=region)
+    ec2 = session.client('ec2', region_name=region)
+
+    nodegroups_resp = eks.list_nodegroups(clusterName=cluster_name)
+    nodegroups = nodegroups_resp.get('nodegroups', [])
+
+    instances = []
+    asg_instance_ids = []
+    asg_to_nodegroup = {}
+
+    for ng_name in nodegroups:
+        ng = eks.describe_nodegroup(clusterName=cluster_name, nodegroupName=ng_name)['nodegroup']
+        resources = ng.get('resources', {})
+        asgs = resources.get('autoScalingGroups', [])
+        for asg in asgs:
+            asg_name = asg['name']
+            asg_to_nodegroup[asg_name] = ng_name
+
+    if not asg_to_nodegroup:
+        return instances
+
+    paginator = autoscaling.get_paginator('describe_auto_scaling_instances')
+    for page in paginator.paginate():
+        for inst in page['AutoScalingInstances']:
+            if inst['AutoScalingGroupName'] in asg_to_nodegroup:
+                asg_instance_ids.append({
+                    'InstanceId': inst['InstanceId'],
+                    'AutoScalingGroupName': inst['AutoScalingGroupName'],
+                    'LifecycleState': inst['LifecycleState'],
+                    'NodegroupName': asg_to_nodegroup[inst['AutoScalingGroupName']],
+                })
+
+    if not asg_instance_ids:
+        return instances
+
+    ids = [i['InstanceId'] for i in asg_instance_ids]
+    resp = ec2.describe_instances(InstanceIds=ids)
+    id_to_details = {}
+    for reservation in resp['Reservations']:
+        for inst in reservation['Instances']:
+            name = ''
+            for tag in inst.get('Tags', []):
+                if tag['Key'] == 'Name':
+                    name = tag['Value']
+                    break
+            id_to_details[inst['InstanceId']] = {
+                'InstanceType': inst['InstanceType'],
+                'AvailabilityZone': inst['Placement']['AvailabilityZone'],
+                'Name': name,
+            }
+
+    for mapping in asg_instance_ids:
+        iid = mapping['InstanceId']
+        details = id_to_details.get(iid, {})
+        instances.append({
+            'InstanceId': iid,
+            'NodegroupName': mapping['NodegroupName'],
+            'AutoScalingGroupName': mapping['AutoScalingGroupName'],
+            'LifecycleState': mapping['LifecycleState'],
+            'InstanceType': details.get('InstanceType', 'unknown'),
+            'AvailabilityZone': details.get('AvailabilityZone', 'unknown'),
+            'Name': details.get('Name', ''),
+        })
+
+    return instances
+
+
+def get_instance_health(instance_id, region, profile=None):
+    """Fetch EC2 instance status checks. Returns dict."""
+    session = _session(profile)
+    ec2 = session.client('ec2', region_name=region)
+    try:
+        resp = ec2.describe_instance_status(InstanceIds=[instance_id], IncludeAllInstances=True)
+        statuses = resp.get('InstanceStatuses', [])
+        if not statuses:
+            return {'SystemStatus': 'unknown', 'InstanceStatus': 'unknown'}
+        s = statuses[0]
+        return {
+            'SystemStatus': s.get('SystemStatus', {}).get('Status', 'unknown'),
+            'InstanceStatus': s.get('InstanceStatus', {}).get('Status', 'unknown'),
+        }
+    except ClientError as e:
+        return {'SystemStatus': f'error: {e}', 'InstanceStatus': f'error: {e}'}
+
+
+if __name__ == '__main__':
+    pass
